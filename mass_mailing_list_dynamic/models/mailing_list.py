@@ -43,12 +43,44 @@ class MassMailingList(models.Model):
         for one in dynamic:
             sync_domain = [("email", "!=", False)] + safe_eval(one.sync_domain)
             desired_partners = Partner.search(sync_domain)
+            # Deduplicate by email: if company and person share the same email,
+            # keep the person (is_company=False) over the company
+            seen_emails = {}
+            for partner in desired_partners:
+                email_key = (partner.email or "").strip().lower()
+                if not email_key:
+                    continue
+                if email_key not in seen_emails:
+                    seen_emails[email_key] = partner
+                elif seen_emails[email_key].is_company and not partner.is_company:
+                    seen_emails[email_key] = partner
+            desired_partners = Partner.browse([p.id for p in seen_emails.values()])
             final_contacts = one.contact_ids
             # Detach or remove undesired contacts when synchronization is full
             if one.sync_method == "full":
                 final_contacts -= final_contacts.filtered(
                     lambda r, dp=desired_partners: r.partner_id not in dp
                 )
+            # If a company contact is in the list but a person with the same
+            # email now exists in desired_partners, replace the company with the person
+            desired_email_to_partner = {}
+            for partner in desired_partners:
+                email_key = (partner.email or "").strip().lower()
+                if email_key:
+                    desired_email_to_partner[email_key] = partner
+            to_replace = self.env["mailing.contact"]
+            for contact in final_contacts:
+                email_key = (contact.email or "").strip().lower()
+                desired = desired_email_to_partner.get(email_key)
+                if (
+                    desired
+                    and desired != contact.partner_id
+                    and contact.partner_id.is_company
+                    and not desired.is_company
+                ):
+                    to_replace |= contact
+            final_contacts -= to_replace
+            detached |= to_replace
             # Add new contacts
             current_partners = final_contacts.mapped("partner_id")
             for partner in desired_partners - current_partners:
